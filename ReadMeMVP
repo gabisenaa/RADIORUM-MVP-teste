@@ -1,0 +1,10 @@
+# RADIORUM MVP
+
+Plataforma de Diagnóstico por Imagem - MVP  
+Stack: Next.js 14 (App Router) + TypeScript, TailwindCSS, shadcn/ui, Lucide, Supabase
+
+Este repositório será utilizado para o desenvolvimento automatizado do MVP conforme o workflow solicitado.  
+
+## Autor
+
+@gabisenaa

@@ -1,0 +1,276 @@
+name: Auto Setup RADIORUM-MVP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node (required later) and git
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install GH CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl git
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update
+          sudo apt install -y gh
+
+      - name: Configure Git
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: Authenticate GH CLI with token
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Authenticate gh using the built-in token so gh commands can create PRs
+          echo "${GITHUB_TOKEN}" | gh auth login --with-token
+
+      - name: Create feature/base-setup branch with base files and open PR
+        env:
+          SUPABASE_SERVICE_URL: ${{ secrets.SUPABASE_SERVICE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
+        run: |
+          set -euo pipefail
+
+          BRANCH="feature/base-setup"
+          git checkout -B "$BRANCH"
+
+          # Create folders
+          mkdir -p lib components app app/api app/api/create-case app/api/upload-url app/api/notify-upload app/api/generate-report app/api/send-email app/cases app/auth migrations pr_templates
+
+          # lib/supabaseClient.ts
+          cat > lib/supabaseClient.ts <<'TS'
+import { createClient } from '@supabase/supabase-js';
+
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+
+export const supabaseClient = createClient(supabaseUrl, supabaseAnonKey);
+
+// Admin client (server-side only)
+export const supabaseAdmin = createClient(
+  process.env.SUPABASE_SERVICE_URL || supabaseUrl,
+  process.env.SUPABASE_SERVICE_ROLE_KEY || ''
+);
+TS
+
+          # .env.example
+          cat > .env.example <<'ENV'
+NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=pk_anon_key_here
+
+SUPABASE_SERVICE_ROLE_KEY=sk_service_role_here
+SUPABASE_SERVICE_URL=https://your-project.supabase.co
+
+RESEND_API_KEY=prxy_resend_api_key_here
+RESEND_FROM=hello@yourdomain.com
+
+DATABASE_URL=postgresql://postgres:password@dbhost:5432/postgres
+
+NEXT_PUBLIC_VERCEL_URL=https://your-vercel-deployment.vercel.app
+ENV
+
+          # Minimal pages and components (placeholders)
+          cat > app/layout.tsx <<'TSX'
+import './globals.css';
+import { ReactNode } from 'react';
+import Header from '@/components/Header';
+
+export const metadata = {
+  title: 'Radiorum — Telemedicina',
+  description: 'Envie imagens médicas e receba laudos por especialistas'
+};
+
+export default function RootLayout({ children }: { children: ReactNode }) {
+  return (
+    <html lang="pt-BR">
+      <body className="bg-gray-50 min-h-screen">
+        <Header />
+        <main className="max-w-5xl mx-auto p-6">{children}</main>
+      </body>
+    </html>
+  );
+}
+TSX
+
+          cat > app/globals.css <<'CSS'
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { --brand-yellow: #FFD400; --brand-text: #111827; }
+body { background: #f8fafc; color: var(--brand-text); }
+CSS
+
+          cat > components/Header.tsx <<'TSX'
+import Link from 'next/link';
+export default function Header() {
+  return (
+    <header className="bg-white border-b">
+      <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
+        <div className="font-bold">Radiorum</div>
+        <nav className="flex gap-4">
+          <Link href="/dashboard">Dashboard</Link>
+          <Link href="/cases/new">Novo Caso</Link>
+          <Link href="/auth">Entrar</Link>
+        </nav>
+      </div>
+    </header>
+  );
+}
+TSX
+
+          cat > app/page.tsx <<'TSX'
+export default function Home() {
+  return <div className="p-8">Radiorum — inicial (placeholder)</div>;
+}
+TSX
+
+          # Minimal APIs (create-case + upload-url + notify-upload + generate-report + send-email)
+          cat > app/api/create-case/route.ts <<'TS'
+import { NextResponse } from 'next/server';
+import { supabaseAdmin } from '@/lib/supabaseClient';
+
+export async function POST(req: Request) {
+  const body = await req.json();
+  const { patient_initials } = body;
+  if (!patient_initials) return NextResponse.json({ error: 'patient_initials required' }, { status: 400 });
+
+  const insert = await supabaseAdmin.from('cases').insert([{ patient_initials }]).select('id').single();
+  if (insert.error) return NextResponse.json({ error: insert.error.message }, { status: 500 });
+  await supabaseAdmin.from('events').insert([{ case_id: insert.data.id, type: 'case.created', payload: { note: 'Criado via workflow' } }]);
+  return NextResponse.json({ id: insert.data.id });
+}
+TS
+
+          cat > app/api/upload-url/route.ts <<'TS'
+import { NextResponse } from 'next/server';
+import { supabaseAdmin } from '@/lib/supabaseClient';
+
+export async function POST(req: Request) {
+  const { caseId, filename } = await req.json();
+  if (!caseId || !filename) return NextResponse.json({ error: 'missing' }, { status: 400 });
+  const key = `cases/${caseId}/${Date.now()}_${filename}`;
+  const { data, error } = await supabaseAdmin.storage.from('case-files').createSignedUploadUrl(key, 60 * 15);
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  return NextResponse.json({ url: data.signedUrl, path: key });
+}
+TS
+
+          cat > app/api/notify-upload/route.ts <<'TS'
+import { NextResponse } from 'next/server';
+import { supabaseAdmin } from '@/lib/supabaseClient';
+
+export async function POST(req: Request) {
+  const body = await req.json();
+  const { caseId, storage_path, filename } = body;
+  if (!caseId || !storage_path || !filename) return NextResponse.json({ error: 'missing' }, { status: 400 });
+  const { error } = await supabaseAdmin.from('case_files').insert([{ case_id: caseId, storage_path, filename }]);
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  await supabaseAdmin.from('events').insert([{ case_id: caseId, type: 'file.uploaded', payload: { filename } }]);
+  return NextResponse.json({ ok: true });
+}
+TS
+
+          cat > app/api/generate-report/route.ts <<'TS'
+import { NextResponse } from 'next/server';
+import { supabaseAdmin } from '@/lib/supabaseClient';
+import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+
+export async function POST(req: Request) {
+  const { caseId, content } = await req.json();
+  if (!caseId || !content) return NextResponse.json({ error: 'missing' }, { status: 400 });
+  const pdf = await PDFDocument.create();
+  const page = pdf.addPage([600, 800]);
+  const font = await pdf.embedFont(StandardFonts.Helvetica);
+  page.drawText(`Laudo: ${caseId}`, { x: 50, y: 760, size: 14, font });
+  page.drawText(content.slice(0, 1000), { x: 50, y: 720, size: 10, font });
+  const bytes = await pdf.save();
+  const path = `reports/${caseId}/report_${Date.now()}.pdf`;
+  await supabaseAdmin.storage.from('reports').upload(path, Buffer.from(bytes), { contentType: 'application/pdf' });
+  await supabaseAdmin.from('reports').insert([{ case_id: caseId, storage_path: path, content }]);
+  await supabaseAdmin.from('events').insert([{ case_id: caseId, type: 'report.generated', payload: { path } }]);
+  return NextResponse.json({ path });
+}
+TS
+
+          cat > app/api/send-email/route.ts <<'TS'
+import { NextResponse } from 'next/server';
+import fetch from 'node-fetch';
+
+export async function POST(req: Request) {
+  const { to, subject, html } = await req.json();
+  if (!to || !subject || !html) return NextResponse.json({ error: 'missing' }, { status: 400 });
+
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: process.env.RESEND_FROM, to: [to], subject, html })
+  });
+  const data = await res.json();
+  if (!res.ok) return NextResponse.json({ error: data }, { status: 500 });
+  return NextResponse.json({ ok: true, data });
+}
+TS
+
+          # Basic migrations (three files)
+          cat > migrations/001_init.sql <<'SQL'
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE TABLE IF NOT EXISTS profiles (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), full_name text, role text, initials text, created_at timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS cases (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), created_by uuid REFERENCES profiles(id), patient_initials text, patient_age int, patient_sex text, description text, status text DEFAULT 'open', created_at timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS case_files (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), case_id uuid REFERENCES cases(id) ON DELETE CASCADE, storage_path text, filename text, mime text, size bigint, created_at timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS reports (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), case_id uuid REFERENCES cases(id) ON DELETE CASCADE, storage_path text, content text, created_at timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS events (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), case_id uuid REFERENCES cases(id) ON DELETE CASCADE, type text, payload jsonb, created_at timestamptz DEFAULT now());
+SQL
+
+          cat > migrations/002_rls_policies.sql <<'SQL'
+-- Enable RLS placeholders (review policies before enabling in production)
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cases ENABLE ROW LEVEL SECURITY;
+ALTER TABLE case_files ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reports ENABLE ROW LEVEL SECURITY;
+ALTER TABLE events ENABLE ROW LEVEL SECURITY;
+SQL
+
+          cat > migrations/003_seed.sql <<'SQL'
+-- seed example
+INSERT INTO profiles (id, full_name, role, initials) VALUES (gen_random_uuid(), 'Admin One', 'admin', 'A1');
+SQL
+
+          # PR template (simple)
+          cat > pr_templates/feature-base-setup.md <<'MD'
+# PR: feature/base-setup
+Adiciona base do app (supabase client, páginas placeholder, APIs e migrations).
+MD
+
+          git add -A
+          git commit -m "feat: base setup (supabase client, pages, apis, migrations)" || true
+          git push -u origin HEAD:$BRANCH --force
+
+          # Create PR via gh if available
+          if command -v gh >/dev/null 2>&1; then
+            gh pr create --base main --head "$BRANCH" --title "feat: base-setup" --body-file pr_templates/feature-base-setup.md || true
+          fi
+
+          echo "Branch $BRANCH criada e PR proposto (se gh autenticado). Verifique no GitHub."
